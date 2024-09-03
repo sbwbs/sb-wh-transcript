@@ -4,17 +4,21 @@ import json
 from datetime import datetime
 import httpx
 import os
-import time
 
 app = FastAPI()
 
-# Global variables to store the latest webhook payload and email
 latest_payload = None
 latest_email = None
 
+# Sendbird API configuration
 SENDBIRD_API_TOKEN = os.environ.get("SENDBIRD_API_TOKEN")
 if not SENDBIRD_API_TOKEN:
     raise ValueError("SENDBIRD_API_TOKEN environment variable is not set")
+
+# Zapier webhook URL
+ZAPIER_WEBHOOK_URL = os.environ.get("ZAPIER_WEBHOOK_URL")
+if not ZAPIER_WEBHOOK_URL:
+    raise ValueError("ZAPIER_WEBHOOK_URL environment variable is not set")
 
 async def get_sendbird_messages(app_id: str, channel_url: str, message_ts: int = None):
     url = f"https://api-{app_id}.sendbird.com/v3/group_channels/{channel_url}/messages"
@@ -23,21 +27,34 @@ async def get_sendbird_messages(app_id: str, channel_url: str, message_ts: int =
         "Content-Type": "application/json"
     }
     params = {
-        "prev_limit": 30,  # Adjust this value to get more or fewer messages
+        "prev_limit": 30,
         "next_limit": 30,
-        "include": True
+        "include": True,
+        "message_ts": message_ts if message_ts else int(datetime.now().timestamp() * 1000)
     }
-    
-    if message_ts:
-        params["message_ts"] = message_ts
-    else:
-        # If no timestamp is provided, use the current time
-        params["message_ts"] = int(time.time() * 1000)
 
     async with httpx.AsyncClient() as client:
         response = await client.get(url, headers=headers, params=params)
         response.raise_for_status()
         return response.json()
+
+async def send_to_zapier(email: str, transcript: str):
+    payload = {
+        "email": email,
+        "transcript": transcript
+    }
+    async with httpx.AsyncClient() as client:
+        response = await client.post(ZAPIER_WEBHOOK_URL, json=payload)
+        response.raise_for_status()
+        return response.json()
+
+def format_transcript(messages: list) -> str:
+    transcript = []
+    for message in messages:
+        nickname = message['user']['nickname']
+        content = message['message']
+        transcript.append(f"{nickname}: {content}")
+    return "\n".join(transcript)
 
 @app.post("/sbwebhook")
 async def handle_sendbird_webhook(request: Request):
@@ -53,7 +70,6 @@ async def handle_sendbird_webhook(request: Request):
         
         latest_payload = payload
         
-        # Extract email from the payload
         for form in payload.get('forms', []):
             for data in form.get('data', []):
                 if data.get('name') == 'Email':
@@ -64,14 +80,18 @@ async def handle_sendbird_webhook(request: Request):
         app_id = payload.get('app_id')
         message_id = payload.get('form_message', {}).get('message_id')
         
-        if channel_url and app_id:
+        if channel_url and app_id and latest_email:
             try:
-                message_ts = int(message_id / 1000) if message_id else None
-                messages = await get_sendbird_messages(app_id, channel_url, message_ts)
-                print("Retrieved messages:")
-                print(json.dumps(messages, indent=2))
+                message_ts = int(message_id)
+                messages_data = await get_sendbird_messages(app_id, channel_url, message_ts)
+                messages = messages_data.get('messages', [])
+                
+                transcript = format_transcript(messages)
+                
+                await send_to_zapier(latest_email, transcript)
+                print("Sent transcript to Zapier webhook")
             except Exception as e:
-                print(f"Error retrieving messages: {str(e)}")
+                print(f"Error processing messages or sending to webhook: {str(e)}")
         
     return {"status": "ok"}
 
